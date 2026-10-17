@@ -15,53 +15,29 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-// 日志必须写在 mod 目录之外：mod 目录里的任何文件都会计入内容摘要，
-// 每次写日志都会让已保存的信任记录失配，导致 mod 被停用。
-const LOG_FILE = path.join(__dirname, '..', '..', 'desktop-lyric.log');
+// 日志写在 mod 自己的数据目录里（与 api.storage.data 同一个目录）。
+// 不能写进 mod 目录（会计入内容摘要，导致信任记录失配）；
+// 也不该写到 Folia 用户目录根下（那是宿主的地盘）。
+const LOG_FILE = path.join(
+  process.env.APPDATA || '', 'Folia', 'mods-data', 'desktop-lyric', 'desktop-lyric.log',
+);
 
 function fileLog(message) {
   try {
+    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
     fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${message}\n`, 'utf8');
   } catch { /* 日志失败不影响功能 */ }
 }
 
-/** 取得 electron 模块：优先直接 require，失败时从已加载模块的 require 兜底。 */
+/** 取得 electron 模块。主进程入口里直接 require 即可。 */
 function getElectron() {
-  const failures = [];
   try {
     return require('electron');
   } catch (error) {
-    failures.push(`direct: ${error.message}`);
+    const message = `无法加载 electron 模块 -> ${error.message}`;
+    fileLog(message);
+    throw new Error(message);
   }
-  try {
-    const Module = require('node:module');
-    const cache = Module._cache || {};
-    for (const key of Object.keys(cache)) {
-      const mod = cache[key];
-      if (!mod || typeof mod.require !== 'function') continue;
-      try {
-        const electron = mod.require('electron');
-        if (electron && electron.BrowserWindow) {
-          fileLog(`electron 通过模块缓存取得: ${key}`);
-          return electron;
-        }
-      } catch { /* 换下一个 */ }
-    }
-    failures.push('module-cache: 未找到');
-  } catch (error) {
-    failures.push(`module-cache: ${error.message}`);
-  }
-  try {
-    if (process.mainModule && typeof process.mainModule.require === 'function') {
-      const electron = process.mainModule.require('electron');
-      if (electron && electron.BrowserWindow) return electron;
-    }
-  } catch (error) {
-    failures.push(`mainModule: ${error.message}`);
-  }
-  const message = `无法加载 electron 模块 -> ${failures.join(' | ')}`;
-  fileLog(message);
-  throw new Error(message);
 }
 
 // 窗口宽度不写死：由渲染层量出文字实际宽度后回报，窗口贴着文字收放。
@@ -77,13 +53,17 @@ const FONT_DEFAULT = 19;
 // 没有可显示的歌词行时的占位文字：整首歌都没有歌词 → 未检测到歌词；有歌词但当前是前奏/间奏/纯音乐 → 纯音乐
 const NO_LYRIC_TEXT = '未检测到歌词';
 const PURE_MUSIC_TEXT = '纯音乐';
-const HOTKEY_LOCK = 'CommandOrControl+Shift+L';
-const HOTKEY_VISIBLE = 'CommandOrControl+Shift+H';
-const HOTKEY_NEXT = 'CommandOrControl+Shift+Right';
-const HOTKEY_PREV = 'CommandOrControl+Shift+Left';
-const HOTKEY_PLAY = 'CommandOrControl+Shift+Space';
-const HOTKEY_FONT_UP = 'CommandOrControl+Shift+Up';
-const HOTKEY_FONT_DOWN = 'CommandOrControl+Shift+Down';
+// 全局快捷键会抢走其他软件里的同名组合键，所以默认不注册，
+// 由用户在模组设置里自己决定要不要开。
+const HOTKEY_BINDINGS = {
+  lock: 'CommandOrControl+Shift+L',
+  visible: 'CommandOrControl+Shift+H',
+  next: 'CommandOrControl+Shift+Right',
+  prev: 'CommandOrControl+Shift+Left',
+  play: 'CommandOrControl+Shift+Space',
+  fontUp: 'CommandOrControl+Shift+Up',
+  fontDown: 'CommandOrControl+Shift+Down',
+};
 const COLOR_DEFAULT = { lyric: '#ffffff', meta: '#ffffff' };
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
@@ -98,7 +78,6 @@ module.exports = function activate(api) {
   };
 
   fileLog('=== mod 主入口开始激活 ===');
-
   // 在这里（而不是模块顶层）取 electron：抛错会被 modSystem 捕获并记为 mod 错误，
   // 不会影响 Folia 主进程启动。
   const { BrowserWindow, screen, ipcMain, globalShortcut } = getElectron();
@@ -109,15 +88,20 @@ module.exports = function activate(api) {
   let fontSize = FONT_DEFAULT;
   /** 歌词 / 作者名颜色（#rrggbb），桌面背景上百花齐放时换一个看得清的。 */
   let colors = { ...COLOR_DEFAULT };
+  /** 是否注册全局快捷键（默认关，用户自己开）。 */
+  let hotkeysEnabled = false;
+  /** 调色板是否展开（展开时窗口要更高）。 */
+  let paletteOpen = false;
   let pollTimer = null;
   let lastPushed = '';
   let disposed = false;
   /** 待 client 入口取走的播放控制命令 */
   let pendingCommands = [];
 
-  /** 窗口高度随字号变化（两行：歌名在上、歌词在下），保证字不会被裁掉。 */
-  // 窗口高度随字号变化：够放下「歌名/歌手 + 工具条」一行 + 歌词一行 + 提示一行
+  /** 窗口高度随字号变化：歌名 + 按钮一行、歌词一行，再留一点空隙。 */
   const heightForFont = (size) => Math.round(size * 2.1) + 42;
+  /** 调色板展开时额外占的高度。 */
+  const PALETTE_EXTRA_HEIGHT = 108;
 
   // ---------------------------------------------------------------- 位置
 
@@ -154,12 +138,24 @@ module.exports = function activate(api) {
     if (content <= 0) return;
     const want = Math.min(WIN_W_MAX, Math.max(WIN_W_MIN, content + WIN_W_MARGIN));
     const b = win.getBounds();
-    if (Math.abs(b.width - want) < 2) return;
+    const height = heightForFont(fontSize) + (paletteOpen ? PALETTE_EXTRA_HEIGHT : 0);
+    if (Math.abs(b.width - want) < 2 && b.height === height) return;
     const area = screen.getPrimaryDisplay().workArea;
-    const height = heightForFont(fontSize);
     const x = Math.min(Math.max(area.x, b.x), Math.max(area.x, area.x + area.width - want));
     const y = Math.min(Math.max(area.y, b.y), Math.max(area.y, area.y + area.height - height));
     win.setBounds({ x, y, width: want, height });
+  };
+
+  /** 调色板展开 / 收起时补上或收回多出来的高度。 */
+  const setPaletteOpen = (open) => {
+    paletteOpen = Boolean(open);
+    if (!win || win.isDestroyed()) return;
+    const b = win.getBounds();
+    const height = heightForFont(fontSize) + (paletteOpen ? PALETTE_EXTRA_HEIGHT : 0);
+    if (b.height === height) return;
+    const area = screen.getPrimaryDisplay().workArea;
+    const y = Math.min(Math.max(area.y, b.y), Math.max(area.y, area.y + area.height - height));
+    win.setBounds({ x: b.x, y, width: b.width, height });
   };
 
   const loadBounds = async () => {
@@ -253,6 +249,19 @@ module.exports = function activate(api) {
     return locked;
   };
 
+  /** 读用户是否开启过全局快捷键；没存过就不注册。 */
+  const loadHotkeysEnabled = async () => {
+    try {
+      const saved = await api.storage.data.get('hotkeys');
+      hotkeysEnabled = saved === true;
+    } catch (error) {
+      logErr('读取快捷键设置失败', error);
+      hotkeysEnabled = false;
+    }
+    log(`全局快捷键: ${hotkeysEnabled ? '已开启' : '未开启'}`);
+    return hotkeysEnabled;
+  };
+
   /** 调整字号：窗口高度跟着变（底边保持不动），并把新字号推给渲染层。 */
   const applyFontSize = async (next) => {
     const size = Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round(Number(next) || FONT_DEFAULT)));
@@ -303,6 +312,7 @@ module.exports = function activate(api) {
   const createWindow = async () => {
     const bounds = await loadBounds();
     await loadLocked();
+    await loadHotkeysEnabled();
     if (disposed) return;
 
     win = new BrowserWindow({
@@ -330,7 +340,9 @@ module.exports = function activate(api) {
       },
     });
 
-    win.setAlwaysOnTop(true, 'screen-saver');
+    // 普通置顶：压住其他普通窗口，但 Folia 主窗口等仍能盖住它。
+    // 不用 'screen-saver' —— 那是最顶层，连 Folia 自己都点不到下面的东西了。
+    win.setAlwaysOnTop(true, 'normal');
     win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
     win.setMenuBarVisibility(false);
 
@@ -343,6 +355,14 @@ module.exports = function activate(api) {
     });
 
     win.on('moved', () => { void saveBounds(); });
+    // 关窗只隐藏，不销毁：窗口一旦销毁就再也打不开，
+    // 显示/隐藏快捷键和按钮都会失效，只能重载模组才能恢复。
+    win.on('close', (event) => {
+      if (disposed || !win) return;
+      event.preventDefault();
+      win.hide();
+      log('窗口已关闭（实际是隐藏，可用快捷键或按钮再次显示）');
+    });
     win.on('closed', () => { win = null; });
 
     await win.loadFile(path.join(__dirname, 'lyric.html'));
@@ -466,9 +486,9 @@ module.exports = function activate(api) {
   const onWindowCommand = (event, name, arg) => {
     if (!win || win.isDestroyed() || event.sender !== win.webContents) return;
     const text = String(name || '');
-    // 调色板选了颜色：color:<lyric|meta>:#rrggbb
-    if (text.startsWith('color:')) {
-      const [, target, hex] = text.split(':');
+    // 调色板选了颜色：command('color', 'lyric:#rrggbb')
+    if (text === 'color') {
+      const [target, hex] = String(arg || '').split(':');
       void applyColors(target, hex);
       return;
     }
@@ -485,6 +505,7 @@ module.exports = function activate(api) {
       case 'font-up': void applyFontSize(fontSize + 2); break;
       case 'font-down': void applyFontSize(fontSize - 2); break;
       case 'fit': fitWidthToText(arg); break;
+      case 'palette': setPaletteOpen(arg); break;
       // 窗口内按住拖动：页面上报屏幕坐标，主进程算位移后移动窗口。
       // 用页面自绘拖动（而非 -webkit-app-region: drag）是为了保留点击事件。
       case 'drag-start':
@@ -544,7 +565,7 @@ module.exports = function activate(api) {
       return { ok: true, locked, visible: Boolean(win && !win.isDestroyed() && win.isVisible()) };
     });
 
-    // Folia 界面上的按钮 → 在这里切换歌词条状态：
+    // client 入口（Folia 界面里的锁按钮）→ 在这里切换歌词条状态：
     //   锁定时点一下 = 弹出控制条（解除穿透，可拖动、可点按钮、可调字号）
     //   未锁定时点一下 = 重新锁定（鼠标穿透，打游戏不会误触）
     api.rpc.handle('toggle-tools', () => {
@@ -557,24 +578,52 @@ module.exports = function activate(api) {
       return { ok: true, locked };
     });
 
-    await createWindow();
+    // 开 / 关全局快捷键（默认关）。
+    api.rpc.handle('toggle-hotkeys', () => {
+      hotkeysEnabled = !hotkeysEnabled;
+      if (hotkeysEnabled) registerHotkeys();
+      else unregisterHotkeys();
+      void api.storage.data.set('hotkeys', hotkeysEnabled)
+        .catch((error) => logErr('保存快捷键设置失败', error));
+      log(`全局快捷键: ${hotkeysEnabled ? '开启' : '关闭'}`);
+      return { ok: true, hotkeys: hotkeysEnabled };
+    });
 
-    try {
-      const a = globalShortcut.register(HOTKEY_LOCK, toggleLock);
-      const b = globalShortcut.register(HOTKEY_VISIBLE, toggleVisible);
-      const c = globalShortcut.register(HOTKEY_NEXT, () => queueCommand('next'));
-      const d = globalShortcut.register(HOTKEY_PREV, () => queueCommand('prev'));
-      const e = globalShortcut.register(HOTKEY_PLAY, () => queueCommand('toggle-play'));
-      const f = globalShortcut.register(HOTKEY_FONT_UP, () => { void applyFontSize(fontSize + 2); });
-      const g = globalShortcut.register(HOTKEY_FONT_DOWN, () => { void applyFontSize(fontSize - 2); });
-      log(`快捷键注册: 锁定=${a}, 显示/隐藏=${b}, 下一首=${c}, 上一首=${d}, 播放暂停=${e}, 放大=${f}, 缩小=${g}`);
-    } catch (error) {
-      logErr('注册快捷键失败', error);
-    }
+    await createWindow();
+    // 启动途中可能已被停用：此时不能再注册快捷键和定时器，否则它们会残留。
+    if (disposed) return;
+
+    if (hotkeysEnabled) registerHotkeys();
 
     pollTimer = setInterval(tick, POLL_MS);
     tick();
     log('桌面歌词已启动');
+  };
+
+  /** 注册全局快捷键。默认不开：这些组合键会抢走其他软件里的同名操作。 */
+  const registerHotkeys = () => {
+    unregisterHotkeys();
+    try {
+      const results = {
+        lock: globalShortcut.register(HOTKEY_BINDINGS.lock, toggleLock),
+        visible: globalShortcut.register(HOTKEY_BINDINGS.visible, toggleVisible),
+        next: globalShortcut.register(HOTKEY_BINDINGS.next, () => queueCommand('next')),
+        prev: globalShortcut.register(HOTKEY_BINDINGS.prev, () => queueCommand('prev')),
+        play: globalShortcut.register(HOTKEY_BINDINGS.play, () => queueCommand('toggle-play')),
+        fontUp: globalShortcut.register(HOTKEY_BINDINGS.fontUp, () => { void applyFontSize(fontSize + 2); }),
+        fontDown: globalShortcut.register(HOTKEY_BINDINGS.fontDown, () => { void applyFontSize(fontSize - 2); }),
+      };
+      const failed = Object.keys(results).filter((key) => !results[key]);
+      log(`快捷键注册: ${failed.length === 0 ? '全部成功' : `失败 ${failed.join('/')}`}`);
+    } catch (error) {
+      logErr('注册快捷键失败', error);
+    }
+  };
+
+  const unregisterHotkeys = () => {
+    for (const accelerator of Object.values(HOTKEY_BINDINGS)) {
+      try { globalShortcut.unregister(accelerator); } catch { /* ignore */ }
+    }
   };
 
   api.lifecycle.onDeactivate(() => {
@@ -585,15 +634,7 @@ module.exports = function activate(api) {
       pollTimer = null;
     }
     try { ipcMain.removeListener('desktop-lyric:command', onWindowCommand); } catch { /* ignore */ }
-    try {
-      globalShortcut.unregister(HOTKEY_LOCK);
-      globalShortcut.unregister(HOTKEY_VISIBLE);
-      globalShortcut.unregister(HOTKEY_NEXT);
-      globalShortcut.unregister(HOTKEY_PREV);
-      globalShortcut.unregister(HOTKEY_PLAY);
-      globalShortcut.unregister(HOTKEY_FONT_UP);
-      globalShortcut.unregister(HOTKEY_FONT_DOWN);
-    } catch { /* ignore */ }
+    unregisterHotkeys();
     if (win && !win.isDestroyed()) win.destroy();
     win = null;
     log('桌面歌词已停止');

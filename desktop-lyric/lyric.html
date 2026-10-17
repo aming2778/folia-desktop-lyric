@@ -139,6 +139,48 @@
 
   #hint { display: none; }
 
+  /* ---------------------------------------------------------------- 调色板 */
+  /* 挂在歌词窗口内部（不往宿主页面上挂东西），窗口会按它变宽变高。 */
+
+  #palette {
+    display: none;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(24,24,27,.94);
+    border: 1px solid rgba(255,255,255,.10);
+    box-shadow: 0 12px 32px rgba(0,0,0,.5);
+    color: #e4e4e7;
+    font-size: 12px;
+    font-family: inherit;
+  }
+  body.palette-open #palette { display: flex; }
+
+  #palette .p-title { font-size: 11px; opacity: .55; }
+  #palette .p-row { display: flex; gap: 6px; }
+  #palette .p-row button {
+    width: auto; flex: 1 1 0; height: 24px;
+    border-radius: 6px; font-size: 12px;
+    background: rgba(255,255,255,.10);
+  }
+  #palette .p-row button.on { background: rgba(251,191,36,.85); color: #1c1917; }
+  #palette .p-grid { display: grid; grid-template-columns: repeat(8, 22px); gap: 6px; }
+  #palette .p-grid button {
+    width: 22px; height: 22px; border-radius: 5px; padding: 0;
+    border: 2px solid transparent; box-sizing: border-box;
+  }
+  #palette .p-grid button.on { border-color: #fbbf24; }
+  #palette .p-foot { display: flex; align-items: center; gap: 8px; }
+  #palette input[type=color] {
+    width: 34px; height: 22px; padding: 0; border: none; border-radius: 5px;
+    background: transparent; cursor: pointer;
+  }
+  #palette .p-close {
+    width: auto; height: 22px; margin-left: auto; padding: 0 8px;
+    background: rgba(255,255,255,.10); font-size: 12px;
+  }
+
 </style>
 </head>
 <body>
@@ -146,17 +188,30 @@
     <div id="head">
       <div id="meta"></div>
       <div id="tools">
-        <button id="prev" title="上一首（Ctrl+Shift+←）">⏮</button>
-        <button id="play" title="播放 / 暂停（Ctrl+Shift+空格）">▶</button>
-        <button id="next" title="下一首（Ctrl+Shift+→）">⏭</button>
-        <button id="smaller" title="缩小字号（Ctrl+Shift+↓）">A−</button>
-        <button id="bigger" title="放大字号（Ctrl+Shift+↑）">A+</button>
+        <button id="prev" title="上一首">⏮</button>
+        <button id="play" title="播放 / 暂停">▶</button>
+        <button id="next" title="下一首">⏭</button>
+        <button id="smaller" title="缩小字号">A−</button>
+        <button id="bigger" title="放大字号">A+</button>
         <button id="lock" title="锁定（鼠标穿透，锁定后打游戏不会误触）">🔓</button>
-        <button id="hide" title="隐藏歌词（Ctrl+Shift+H）">✕</button>
+        <button id="color" title="改文字颜色">🎨</button>
+        <button id="hide" title="隐藏歌词">✕</button>
       </div>
     </div>
     <div id="text" class="empty">桌面歌词已就绪，等待播放…</div>
     <div id="hint"></div>
+    <div id="palette">
+      <div class="p-title">桌面歌词 · 文字颜色</div>
+      <div class="p-row">
+        <button type="button" data-target="lyric">歌词</button>
+        <button type="button" data-target="meta">作者名</button>
+      </div>
+      <div class="p-grid"></div>
+      <div class="p-foot">
+        <input type="color" title="自定义颜色" />
+        <button type="button" class="p-close">关闭</button>
+      </div>
+    </div>
   </div>
 
 <script>
@@ -245,6 +300,12 @@
       if (tools) widths.push(tools.offsetWidth + 40);
     }
 
+    // 调色板打开时窗口要放下它
+    const palette = document.getElementById('palette');
+    if (palette && document.body.classList.contains('palette-open')) {
+      widths.push(palette.offsetWidth + 40);
+    }
+
     const want = Math.ceil(Math.max(0, ...widths));
     if (want > 0 && Math.abs(want - lastReportedWidth) > 4) {
       lastReportedWidth = want;
@@ -266,7 +327,59 @@
     const metaRgb = toRgb(next.meta);
     if (lyricRgb) document.documentElement.style.setProperty('--lyric-rgb', lyricRgb);
     if (metaRgb) document.documentElement.style.setProperty('--meta-rgb', metaRgb);
+    colors = { ...colors, ...next };
   }
+
+  // ------------------------------------------------------------ 调色板
+  // 放在歌词窗口内部，由工具条上的 🎨 打开。选中的颜色存进 mod 自己的
+  // 数据（api.storage.data 的 colors 键），下次启动沿用。
+
+  const SWATCHES = ['#ffffff', '#fde047', '#fca5a5', '#86efac', '#7dd3fc', '#c4b5fd', '#fb923c', '#94a3b8'];
+  let colors = { lyric: '#ffffff', meta: '#ffffff' };
+  let paletteTarget = 'lyric';
+
+  const paletteEl = document.getElementById('palette');
+  const paletteGrid = paletteEl.querySelector('.p-grid');
+  const palettePicker = paletteEl.querySelector('input[type=color]');
+
+  function paintPalette() {
+    const current = String(colors[paletteTarget] || '#ffffff').toLowerCase();
+    paletteGrid.replaceChildren();
+    for (const hex of SWATCHES) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.style.background = hex;
+      b.title = hex;
+      if (hex === current) b.classList.add('on');
+      b.addEventListener('click', () => pickColor(hex));
+      paletteGrid.appendChild(b);
+    }
+    for (const b of paletteEl.querySelectorAll('.p-row button')) {
+      b.classList.toggle('on', b.dataset.target === paletteTarget);
+    }
+    if (palettePicker.value.toLowerCase() !== current) palettePicker.value = current;
+  }
+
+  function pickColor(hex) {
+    colors = { ...colors, [paletteTarget]: hex };
+    applyColors(colors);
+    paintPalette();
+    window.desktopLyric.command('color', `${paletteTarget}:${hex}`);
+  }
+
+  function togglePalette() {
+    const open = document.body.classList.toggle('palette-open');
+    if (open) paintPalette();
+    // 窗口高度由主进程控制，调色板要能显示就得先把窗口撑高
+    window.desktopLyric.command('palette', open);
+    window.setTimeout(measure, 60);
+  }
+
+  for (const b of paletteEl.querySelectorAll('.p-row button')) {
+    b.addEventListener('click', () => { paletteTarget = b.dataset.target; paintPalette(); });
+  }
+  palettePicker.addEventListener('input', () => pickColor(palettePicker.value));
+  paletteEl.querySelector('.p-close').addEventListener('click', togglePalette);
 
   window.desktopLyric.onUpdate(render);
   window.desktopLyric.onLock((locked) => {
@@ -275,9 +388,8 @@
     window.setTimeout(measure, 60);
   });
   window.desktopLyric.onFont(renderFont);
-  window.desktopLyric.onColors(applyColors);
+  window.desktopLyric.onColors((next) => { applyColors(next); paintPalette(); });
 
-  // 颜色改到 Folia 界面里的调色板调（桌面歌词窗口太小，浮层会被裁掉）
   const cmd = (name) => () => window.desktopLyric.command(name);
   document.getElementById('prev').addEventListener('click', cmd('prev'));
   document.getElementById('next').addEventListener('click', cmd('next'));
@@ -285,6 +397,7 @@
   document.getElementById('smaller').addEventListener('click', cmd('font-down'));
   document.getElementById('bigger').addEventListener('click', cmd('font-up'));
   document.getElementById('hide').addEventListener('click', cmd('hide'));
+  document.getElementById('color').addEventListener('click', togglePalette);
   el.lock.addEventListener('click', () => {
     window.desktopLyric.command(document.body.classList.contains('unlocked') ? 'lock' : 'unlock');
   });
@@ -309,9 +422,9 @@
     node.addEventListener('pointerdown', (event) => {
       if (event.button !== 0) return;
       if (!document.body.classList.contains('unlocked')) return; // 锁定时不响应
-      // 按钮区的按下不算拖动：否则 pointerup 会被当成「点歌词」把工具条收起，
-      // 按钮自己的 click 就永远不触发了。
-      if (event.target.closest('#tools')) return;
+      // 按钮区和调色板里的按下都不算拖动：否则 pointerup 会被当成「点歌词」
+      // 把工具条收起，按钮和色块自己的 click 就永远不触发了。
+      if (event.target.closest('#tools, #palette')) return;
       dragging = true;
       moved = false;
       startX = event.screenX;

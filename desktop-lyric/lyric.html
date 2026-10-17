@@ -309,6 +309,9 @@
     node.addEventListener('pointerdown', (event) => {
       if (event.button !== 0) return;
       if (!document.body.classList.contains('unlocked')) return; // 锁定时不响应
+      // 按钮区的按下不算拖动：否则 pointerup 会被当成「点歌词」把工具条收起，
+      // 按钮自己的 click 就永远不触发了。
+      if (event.target.closest('#tools')) return;
       dragging = true;
       moved = false;
       startX = event.screenX;

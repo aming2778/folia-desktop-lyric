@@ -6,7 +6,7 @@
   "author": "DSH",
   "license": "MIT",
   "folium": 1,
-  "preview": "preview.png",
+  "preview": "preview.jpg",
   "main": "main.cjs",
   "client": "client.mjs",
   "permissions": [

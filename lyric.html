@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+<title>桌面歌词</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root { --font-size: 19px; --lyric-rgb: 255,255,255; --meta-rgb: 255,255,255; }
+
+  html, body {
+    width: 100%; height: 100%;
+    background: transparent;
+    overflow: hidden;
+    user-select: none;
+    cursor: default;
+    font-family: "Microsoft YaHei", "微软雅黑", "Segoe UI", sans-serif;
+  }
+
+  /* 整条透明，只有文字和按钮可见。
+     拖动：整条 #bar 都是拖动区，按住歌词、作者名或两侧空白都能移动窗口。
+     拖动由页面自己实现（发 move 指令给主进程），不用 -webkit-app-region: drag，
+     因为系统拖动区会吞掉点击事件，那样就没法「点一下收起工具条」了。
+     窗口宽度由主进程按文字实测宽度收放（见 measure()），
+     所以不会有「看不见的大片空白拖动区」挡住桌面点击。 */
+  #bar {
+    position: relative;
+    width: 100%; height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    padding: 10px 16px;
+    background: transparent;
+    user-select: none;
+    opacity: 0;
+    transition: opacity .18s ease;
+  }
+  body.ready #bar { opacity: 1; }
+
+  /* 第一行：歌名 / 歌手 + 按钮 */
+  #head {
+    position: relative;
+    z-index: 1;
+    flex: 0 0 auto;
+    width: auto;
+    max-width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    min-height: 24px;
+  }
+
+  #meta {
+    flex: 0 1 auto;
+    max-width: 100%;
+    text-align: center;
+    font-size: calc(var(--font-size) * 0.62);
+    line-height: 1.2;
+    color: rgba(var(--meta-rgb), .82);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-shadow: 0 1px 2px rgba(0,0,0,.95), 0 0 8px rgba(0,0,0,.7);
+  }
+  #meta:empty { display: none; }
+
+  /* 第二行：当前歌词 */
+  #text {
+    position: relative;
+    z-index: 1;
+    flex: 0 0 auto;
+    width: auto;
+    max-width: 100%;
+    text-align: center;
+    font-size: var(--font-size);
+    font-weight: 400;
+    line-height: 1.3;
+    color: rgb(var(--lyric-rgb));
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-shadow: 0 1px 2px rgba(0,0,0,.95), 0 0 10px rgba(0,0,0,.8);
+  }
+  #text.empty { opacity: .55; }
+
+  /* 歌名与歌词：按住拖动整条歌词。拖动由页面自己实现（main 的 move 指令），
+     不用 -webkit-app-region: drag —— 系统拖动区会吞掉点击事件，
+     那样就没法「点一下收起工具条」了。 */
+  #meta, #text {
+    user-select: none;
+  }
+
+  /* 占位文字（纯音乐 / 未检测到歌词）：比歌词淡一点，但仍然清晰可读 */
+  #text.placeholder {
+    opacity: .72;
+    font-size: calc(var(--font-size) * 0.86);
+    color: rgba(var(--lyric-rgb), .92);
+  }
+
+  /* ---------------------------------------------------------------- 工具条 */
+
+  #tools {
+    flex: 0 0 auto;
+    display: none;
+    align-items: center;
+    gap: 3px;
+    -webkit-app-region: no-drag;
+    transition: opacity .15s ease;
+  }
+
+  /* 未锁定：按钮默认显示，随时可点。
+     点歌名或歌词可以收起/再展开（见下面的 .tools-hidden）。 */
+  body.unlocked #tools { display: flex; opacity: 1; pointer-events: auto; }
+
+  /* 手动收起工具条（再点一下歌词或歌名就会回来） */
+  body.unlocked.tools-hidden #tools { display: none; }
+
+  /* 锁定（硬锁定）：工具条彻底移除、不占位、不接收任何鼠标事件，
+     连锁定按钮自己也不能点。只能从 Folia 界面上的按键或 Ctrl+Shift+L 解锁。 */
+  body:not(.unlocked) #tools { display: none; }
+
+  button {
+    -webkit-app-region: no-drag;
+    width: 26px; height: 26px;
+    display: flex; align-items: center; justify-content: center;
+    border: none; border-radius: 7px;
+    background: rgba(255,255,255,.16);
+    color: #fff; font-size: 13px; line-height: 1;
+    cursor: pointer;
+    transition: background .12s ease;
+  }
+  button:hover { background: rgba(255,255,255,.36); }
+  button:active { background: rgba(255,255,255,.55); }
+  button.on { background: rgba(255,255,255,.42); }
+
+  #hint { display: none; }
+
+  /* ---------------------------------------------------------------- 调色板 */
+  /* 挂在歌词窗口内部（不往宿主页面上挂东西），窗口会按它变宽变高。 */
+
+  #palette {
+    display: none;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: rgba(24,24,27,.94);
+    border: 1px solid rgba(255,255,255,.10);
+    box-shadow: 0 12px 32px rgba(0,0,0,.5);
+    color: #e4e4e7;
+    font-size: 12px;
+    font-family: inherit;
+  }
+  body.palette-open #palette { display: flex; }
+
+  #palette .p-title { font-size: 11px; opacity: .55; }
+  #palette .p-row { display: flex; gap: 6px; }
+  #palette .p-row button {
+    width: auto; flex: 1 1 0; height: 24px;
+    border-radius: 6px; font-size: 12px;
+    background: rgba(255,255,255,.10);
+  }
+  #palette .p-row button.on { background: rgba(251,191,36,.85); color: #1c1917; }
+  #palette .p-grid { display: grid; grid-template-columns: repeat(8, 22px); gap: 6px; }
+  #palette .p-grid button {
+    width: 22px; height: 22px; border-radius: 5px; padding: 0;
+    border: 2px solid transparent; box-sizing: border-box;
+  }
+  #palette .p-grid button.on { border-color: #fbbf24; }
+  #palette .p-foot { display: flex; align-items: center; gap: 8px; }
+  #palette input[type=color] {
+    width: 34px; height: 22px; padding: 0; border: none; border-radius: 5px;
+    background: transparent; cursor: pointer;
+  }
+  #palette .p-close {
+    width: auto; height: 22px; margin-left: auto; padding: 0 8px;
+    background: rgba(255,255,255,.10); font-size: 12px;
+  }
+
+</style>
+</head>
+<body>
+  <div id="bar">
+    <div id="head">
+      <div id="meta"></div>
+      <div id="tools">
+        <button id="prev" title="上一首">⏮</button>
+        <button id="play" title="播放 / 暂停">▶</button>
+        <button id="next" title="下一首">⏭</button>
+        <button id="smaller" title="缩小字号">A−</button>
+        <button id="bigger" title="放大字号">A+</button>
+        <button id="lock" title="锁定（鼠标穿透，锁定后打游戏不会误触）">🔓</button>
+        <button id="color" title="改文字颜色">🎨</button>
+        <button id="hide" title="隐藏歌词">✕</button>
+      </div>
+    </div>
+    <div id="text" class="empty">桌面歌词已就绪，等待播放…</div>
+    <div id="hint"></div>
+    <div id="palette">
+      <div class="p-title">桌面歌词 · 文字颜色</div>
+      <div class="p-row">
+        <button type="button" data-target="lyric">歌词</button>
+        <button type="button" data-target="meta">作者名</button>
+      </div>
+      <div class="p-grid"></div>
+      <div class="p-foot">
+        <input type="color" title="自定义颜色" />
+        <button type="button" class="p-close">关闭</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const el = {
+    text: document.getElementById('text'),
+    meta: document.getElementById('meta'),
+    hint: document.getElementById('hint'),
+    lock: document.getElementById('lock'),
+    play: document.getElementById('play'),
+  };
+
+  function render(payload) {
+    const text = (payload.text || '').trim();
+    if (text) {
+      el.text.textContent = text;
+      el.text.classList.remove('empty');
+      el.text.classList.toggle('placeholder', payload.placeholder === true);
+    } else {
+      el.text.textContent = payload.state === 'stopped' ? '桌面歌词已就绪，等待播放…' : '♪';
+      el.text.classList.add('empty');
+      el.text.classList.remove('placeholder');
+    }
+
+    const parts = [];
+    if (payload.song) parts.push(payload.song);
+    if (payload.artist) parts.push(payload.artist);
+    el.meta.textContent = parts.join(' — ');
+
+    // 播放中显示暂停图标，暂停/停止时显示播放图标
+    const isPlaying = payload.state === 'playing';
+    el.play.textContent = isPlaying ? '⏸' : '▶';
+    el.play.title = isPlaying ? '暂停（Ctrl+Shift+空格）' : '播放（Ctrl+Shift+空格）';
+
+    // 文字变了就重新量宽，让窗口贴着文字收放
+    measure();
+  }
+
+  function renderLock(locked) {
+    document.body.classList.toggle('unlocked', !locked);
+    document.body.classList.remove('tools-hidden');
+    el.lock.textContent = locked ? '🔒' : '🔓';
+    el.lock.title = locked ? '已锁定 · 鼠标穿透，打游戏不会误触（点击解锁）' : '点击锁定（鼠标穿透，打游戏不会误触）';
+    el.lock.classList.toggle('on', locked);
+    el.hint.textContent = '';
+  }
+
+  function renderFont(size) {
+    const n = Number(size);
+    if (Number.isFinite(n) && n > 0) {
+      document.documentElement.style.setProperty('--font-size', n + 'px');
+      measure();
+    }
+  }
+
+  /**
+   * 量出「歌名行」和「歌词行」谁更宽，回报给主进程把窗口收放。
+   * 用临时 absolute 元素量真实文字宽度，不受窗口当前宽度裁切影响。
+   * 只在宽度变化超过 4px 时上报，避免和拖动抢布局。
+   */
+  let lastReportedWidth = 0;
+  function measure() {
+    const probe = document.createElement('span');
+    probe.style.cssText = 'position:absolute;left:-9999px;top:0;white-space:nowrap;visibility:hidden;';
+    document.body.appendChild(probe);
+
+    const widths = [];
+    const metaText = (el.meta.textContent || '').trim();
+    if (metaText) {
+      probe.style.font = getComputedStyle(el.meta).font;
+      widths.push(probe.offsetWidth);
+      probe.textContent = metaText;
+      widths[widths.length - 1] = probe.offsetWidth;
+    }
+    const textContent = (el.text.textContent || '').trim();
+    if (textContent) {
+      probe.style.font = getComputedStyle(el.text).font;
+      probe.textContent = textContent;
+      widths.push(probe.offsetWidth);
+    }
+
+    document.body.removeChild(probe);
+
+    // 未锁定时按钮条要占位，把它算进去
+    if (document.body.classList.contains('unlocked') && !document.body.classList.contains('tools-hidden')) {
+      const tools = document.getElementById('tools');
+      if (tools) widths.push(tools.offsetWidth + 40);
+    }
+
+    // 调色板打开时窗口要放下它
+    const palette = document.getElementById('palette');
+    if (palette && document.body.classList.contains('palette-open')) {
+      widths.push(palette.offsetWidth + 40);
+    }
+
+    const want = Math.ceil(Math.max(0, ...widths));
+    if (want > 0 && Math.abs(want - lastReportedWidth) > 4) {
+      lastReportedWidth = want;
+      window.desktopLyric.command('fit', want);
+    }
+  }
+
+  /** #rrggbb → "r,g,b"，供 CSS 变量与文字阴影共用。 */
+  function toRgb(hex) {
+    const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+    if (!m) return null;
+    const n = parseInt(m[1], 16);
+    return `${(n >> 16) & 255},${(n >> 8) & 255},${n & 255}`;
+  }
+
+  function applyColors(next) {
+    if (!next || typeof next !== 'object') return;
+    const lyricRgb = toRgb(next.lyric);
+    const metaRgb = toRgb(next.meta);
+    if (lyricRgb) document.documentElement.style.setProperty('--lyric-rgb', lyricRgb);
+    if (metaRgb) document.documentElement.style.setProperty('--meta-rgb', metaRgb);
+    colors = { ...colors, ...next };
+  }
+
+  // ------------------------------------------------------------ 调色板
+  // 放在歌词窗口内部，由工具条上的 🎨 打开。选中的颜色存进 mod 自己的
+  // 数据（api.storage.data 的 colors 键），下次启动沿用。
+
+  const SWATCHES = ['#ffffff', '#fde047', '#fca5a5', '#86efac', '#7dd3fc', '#c4b5fd', '#fb923c', '#94a3b8'];
+  let colors = { lyric: '#ffffff', meta: '#ffffff' };
+  let paletteTarget = 'lyric';
+
+  const paletteEl = document.getElementById('palette');
+  const paletteGrid = paletteEl.querySelector('.p-grid');
+  const palettePicker = paletteEl.querySelector('input[type=color]');
+
+  function paintPalette() {
+    const current = String(colors[paletteTarget] || '#ffffff').toLowerCase();
+    paletteGrid.replaceChildren();
+    for (const hex of SWATCHES) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.style.background = hex;
+      b.title = hex;
+      if (hex === current) b.classList.add('on');
+      b.addEventListener('click', () => pickColor(hex));
+      paletteGrid.appendChild(b);
+    }
+    for (const b of paletteEl.querySelectorAll('.p-row button')) {
+      b.classList.toggle('on', b.dataset.target === paletteTarget);
+    }
+    if (palettePicker.value.toLowerCase() !== current) palettePicker.value = current;
+  }
+
+  function pickColor(hex) {
+    colors = { ...colors, [paletteTarget]: hex };
+    applyColors(colors);
+    paintPalette();
+    window.desktopLyric.command('color', `${paletteTarget}:${hex}`);
+  }
+
+  function togglePalette() {
+    const open = document.body.classList.toggle('palette-open');
+    if (open) paintPalette();
+    // 窗口高度由主进程控制，调色板要能显示就得先把窗口撑高
+    window.desktopLyric.command('palette', open);
+    window.setTimeout(measure, 60);
+  }
+
+  for (const b of paletteEl.querySelectorAll('.p-row button')) {
+    b.addEventListener('click', () => { paletteTarget = b.dataset.target; paintPalette(); });
+  }
+  palettePicker.addEventListener('input', () => pickColor(palettePicker.value));
+  paletteEl.querySelector('.p-close').addEventListener('click', togglePalette);
+
+  window.desktopLyric.onUpdate(render);
+  window.desktopLyric.onLock((locked) => {
+    renderLock(locked);
+    // 锁定后工具条消失、宽度可以更小，延迟到布局稳定后再量
+    window.setTimeout(measure, 60);
+  });
+  window.desktopLyric.onFont(renderFont);
+  window.desktopLyric.onColors((next) => { applyColors(next); paintPalette(); });
+
+  const cmd = (name) => () => window.desktopLyric.command(name);
+  document.getElementById('prev').addEventListener('click', cmd('prev'));
+  document.getElementById('next').addEventListener('click', cmd('next'));
+  document.getElementById('play').addEventListener('click', cmd('toggle-play'));
+  document.getElementById('smaller').addEventListener('click', cmd('font-down'));
+  document.getElementById('bigger').addEventListener('click', cmd('font-up'));
+  document.getElementById('hide').addEventListener('click', cmd('hide'));
+  document.getElementById('color').addEventListener('click', togglePalette);
+  el.lock.addEventListener('click', () => {
+    window.desktopLyric.command(document.body.classList.contains('unlocked') ? 'lock' : 'unlock');
+  });
+
+  // 歌名和歌词：按住拖动整个窗口；不移动的「点一下」则收起/展开工具条。
+  // 拖动由页面自己实现（发 drag-start / drag-move / drag-end 给主进程），
+  // 不用 -webkit-app-region: drag —— 系统拖动区会吞掉点击事件。
+  const TAP_SLOP_PX = 4;
+  let dragging = false;
+  let moved = false;
+  let startX = 0;
+  let startY = 0;
+
+  const stopDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    window.desktopLyric.command('drag-end');
+    window.setTimeout(measure, 60); // 松手后布局稳定再量宽度
+  };
+
+  const bindDrag = (node) => {
+    node.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0) return;
+      if (!document.body.classList.contains('unlocked')) return; // 锁定时不响应
+      // 按钮区和调色板里的按下都不算拖动：否则 pointerup 会被当成「点歌词」
+      // 把工具条收起，按钮和色块自己的 click 就永远不触发了。
+      if (event.target.closest('#tools, #palette')) return;
+      dragging = true;
+      moved = false;
+      startX = event.screenX;
+      startY = event.screenY;
+      window.desktopLyric.command('drag-start', { x: startX, y: startY });
+      node.setPointerCapture?.(event.pointerId);
+    });
+
+    node.addEventListener('pointermove', (event) => {
+      if (!dragging) return;
+      if (Math.abs(event.screenX - startX) > TAP_SLOP_PX || Math.abs(event.screenY - startY) > TAP_SLOP_PX) {
+        moved = true;
+      }
+      if (moved) window.desktopLyric.command('drag-move', { x: event.screenX, y: event.screenY });
+    });
+
+    node.addEventListener('pointerup', () => {
+      if (!dragging) return;
+      const wasTap = !moved;
+      stopDrag();
+      if (!wasTap) return;
+      document.body.classList.toggle('tools-hidden');
+      window.setTimeout(measure, 60);
+    });
+
+    node.addEventListener('pointercancel', stopDrag);
+  };
+
+  bindDrag(el.text);
+  bindDrag(el.meta);
+  bindDrag(document.getElementById('bar')); // 两侧空白也能拖
+
+  document.addEventListener('DOMContentLoaded', () => document.body.classList.add('ready'));
+  if (document.readyState !== 'loading') document.body.classList.add('ready');
+</script>
+</body>
+</html>

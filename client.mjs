@@ -159,7 +159,7 @@ export default function activate(folium) {
 
   let registration = null;
   try {
-    registration = folium.registries.controlButtons.register({
+    registration = folium.registries.progressButtons.register({
       id: 'lyric-bar',
       slot: 'progress.leading',
       order: 10,

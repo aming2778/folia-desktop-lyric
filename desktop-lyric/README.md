@@ -117,11 +117,15 @@ Folia 桌面歌词模组：在桌面上常驻一行歌词，普通字体、可�
 
 |权限|用途|
 |-|-|
-|`runtime.playback`|读取当前歌曲与歌词进度，用来显示歌词|
+|`playback.read`|读取当前歌曲与歌词进度，用来显示歌词|
 |`playback.control`|上一首 / 下一首 / 播放暂停|
 |`filesystem.data`|保存位置、字号、颜色、锁定状态|
 
 模组不上传任何数据，不下载执行远程代码，只在模组自己的数据目录（`mods-data/desktop-lyric`）里保存窗口位置、字号、颜色、锁定状态，不改动 Folia 主界面的任何设置和本地数据。
+
+排查用的日志也在这个数据目录里（`files/desktop-lyric.log`），超过 1 MB 会自动从头重写，不会无限增长。
+
+> 需要 Folia 0.7.21 及以上版本。`playback.read` 是 Folium 2 的新权限名，低版本请改用 `runtime.playback`。
 
 ## 技术说明
 

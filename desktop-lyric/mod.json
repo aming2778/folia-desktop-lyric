@@ -1,16 +1,15 @@
 {
   "id": "desktop-lyric",
   "name": "桌面歌词",
-  "version": "1.0.1",
+  "version": "1.0.4",
   "description": "在桌面显示一行歌词（普通字体），支持锁定（鼠标穿透）、拖动、切换歌曲和自定义颜色。",
-  "author": "DSH",
-  "license": "MIT",
+  "author": "aming2778",
   "folium": 1,
   "preview": "preview.jpg",
   "main": "main.cjs",
   "client": "client.mjs",
   "permissions": [
-    "runtime.playback",
+    "playback.read",
     "playback.control",
     "filesystem.data"
   ]

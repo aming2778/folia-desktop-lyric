@@ -15,29 +15,39 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
-// 日志写在 mod 自己的数据目录里（与 api.storage.data 同一个目录）。
+// 日志写在 mod 自己的数据目录里。路径取自 api.storage.paths.data，
+// 由宿主按 manifest id 拼成绝对路径：自己用 APPDATA 拼的话，macOS / Linux
+// 上环境变量为空，会退化成相对当前工作目录的路径。
 // 不能写进 mod 目录（会计入内容摘要，导致信任记录失配）；
 // 也不该写到 Folia 用户目录根下（那是宿主的地盘）。
-const LOG_FILE = path.join(
-  process.env.APPDATA || '', 'Folia', 'mods-data', 'desktop-lyric', 'desktop-lyric.log',
-);
+let logFile = null;
 
-function fileLog(message) {
+// 日志只用于排查，超过上限就从头重写，避免无限增长。
+const LOG_MAX_BYTES = 1024 * 1024;
+
+function getLogFile(api) {
+  if (logFile) return logFile;
   try {
-    fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
-    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${message}\n`, 'utf8');
-  } catch { /* 日志失败不影响功能 */ }
+    logFile = path.join(api.storage.paths.data, 'desktop-lyric.log');
+  } catch {
+    return null; // 没有 filesystem.data 权限时只能放弃写文件
+  }
+  return logFile;
 }
 
-/** 取得 electron 模块。主进程入口里直接 require 即可。 */
-function getElectron() {
+function fileLog(api, message) {
+  const file = getLogFile(api);
+  if (!file) return;
   try {
-    return require('electron');
-  } catch (error) {
-    const message = `无法加载 electron 模块 -> ${error.message}`;
-    fileLog(message);
-    throw new Error(message);
-  }
+    let size = 0;
+    try { size = fs.statSync(file).size; } catch { /* 首次写入 */ }
+    const line = `[${new Date().toISOString()}] ${message}\n`;
+    if (size + Buffer.byteLength(line) > LOG_MAX_BYTES) {
+      fs.writeFileSync(file, line, 'utf8');
+      return;
+    }
+    fs.appendFileSync(file, line, 'utf8');
+  } catch { /* 日志失败不影响功能 */ }
 }
 
 // 窗口宽度不写死：由渲染层量出文字实际宽度后回报，窗口贴着文字收放。
@@ -68,16 +78,29 @@ const COLOR_DEFAULT = { lyric: '#ffffff', meta: '#ffffff' };
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 module.exports = function activate(api) {
+  // 绑定 api 后的文件日志：下面所有调用点都直接用这一个。
+  const logFile = (message) => fileLog(api, message);
+  /** 取得 electron 模块。主进程入口里直接 require 即可。 */
+  const getElectron = () => {
+    try {
+      return require('electron');
+    } catch (error) {
+      const message = `无法加载 electron 模块 -> ${error.message}`;
+      logFile(message);
+      throw new Error(message);
+    }
+  };
+
   const log = (msg, extra) => {
     api.log.info(`[desktop-lyric] ${msg}`, extra);
-    fileLog(msg + (extra === undefined ? '' : ` ${JSON.stringify(extra)}`));
+    logFile(msg + (extra === undefined ? '' : ` ${JSON.stringify(extra)}`));
   };
   const logErr = (msg, err) => {
     api.log.error(`[desktop-lyric] ${msg}`, err);
-    fileLog(`ERROR ${msg}: ${err && err.stack ? err.stack : String(err)}`);
+    logFile(`ERROR ${msg}: ${err && err.stack ? err.stack : String(err)}`);
   };
 
-  fileLog('=== mod 主入口开始激活 ===');
+  logFile('=== mod 主入口开始激活 ===');
   // 在这里（而不是模块顶层）取 electron：抛错会被 modSystem 捕获并记为 mod 错误，
   // 不会影响 Folia 主进程启动。
   const { BrowserWindow, screen, ipcMain, globalShortcut } = getElectron();
@@ -160,7 +183,7 @@ module.exports = function activate(api) {
 
   const loadBounds = async () => {
     try {
-      const saved = await api.storage.data.get('windowBounds');
+      const saved = await api.storage.get('windowBounds');
       if (saved && typeof saved === 'object' && Number.isFinite(saved.x) && Number.isFinite(saved.y)) {
         const area = screen.getPrimaryDisplay().workArea;
         const height = heightForFont(fontSize);
@@ -179,7 +202,7 @@ module.exports = function activate(api) {
 
   const loadFontSize = async () => {
     try {
-      const saved = await api.storage.data.get('fontSize');
+      const saved = await api.storage.get('fontSize');
       const size = Number(saved);
       if (Number.isFinite(size)) return Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round(size)));
     } catch (error) {
@@ -190,7 +213,7 @@ module.exports = function activate(api) {
 
   const loadColors = async () => {
     try {
-      const saved = await api.storage.data.get('colors');
+      const saved = await api.storage.get('colors');
       if (saved && typeof saved === 'object') {
         for (const key of ['lyric', 'meta']) {
           if (COLOR_RE.test(String(saved[key] || ''))) colors[key] = String(saved[key]);
@@ -206,7 +229,7 @@ module.exports = function activate(api) {
     if (!win || win.isDestroyed()) return;
     try {
       const b = win.getBounds();
-      await api.storage.data.set('windowBounds', { x: b.x, y: b.y, width: b.width });
+      await api.storage.set('windowBounds', { x: b.x, y: b.y, width: b.width });
     } catch (error) {
       logErr('保存窗口位置失败', error);
     }
@@ -231,14 +254,14 @@ module.exports = function activate(api) {
     send('desktop-lyric:lock', locked);
     log(`锁定状态: ${locked ? '已锁定（鼠标穿透）' : '未锁定（可拖动 / 可点击）'}`);
     // 记住这次选择，下次启动沿用（启动时不会一上来就锁死）
-    void api.storage.data.set('locked', locked).catch((error) => logErr('保存锁定状态失败', error));
+    void api.storage.set('locked', locked).catch((error) => logErr('保存锁定状态失败', error));
     return locked;
   };
 
   /** 读上次的锁定状态；没存过就默认不锁，方便一进来就能拖。 */
   const loadLocked = async () => {
     try {
-      const saved = await api.storage.data.get('locked');
+      const saved = await api.storage.get('locked');
       if (typeof saved === 'boolean') locked = saved;
       else locked = false;
     } catch (error) {
@@ -252,7 +275,7 @@ module.exports = function activate(api) {
   /** 读用户是否开启过全局快捷键；没存过就不注册。 */
   const loadHotkeysEnabled = async () => {
     try {
-      const saved = await api.storage.data.get('hotkeys');
+      const saved = await api.storage.get('hotkeys');
       hotkeysEnabled = saved === true;
     } catch (error) {
       logErr('读取快捷键设置失败', error);
@@ -276,7 +299,7 @@ module.exports = function activate(api) {
       send('desktop-lyric:font', size);
     }
     try {
-      await api.storage.data.set('fontSize', size);
+      await api.storage.set('fontSize', size);
     } catch (error) {
       logErr('保存字号失败', error);
     }
@@ -294,7 +317,7 @@ module.exports = function activate(api) {
     colors = { ...colors, [key]: String(hex) };
     send('desktop-lyric:colors', colors);
     try {
-      await api.storage.data.set('colors', colors);
+      await api.storage.set('colors', colors);
     } catch (error) {
       logErr('保存颜色失败', error);
     }
@@ -561,7 +584,7 @@ module.exports = function activate(api) {
 
     // client 入口（渲染层）写日志到本文件，用于事后核对按钮状态同步是否正常。
     api.rpc.handle('client-log', (message) => {
-      fileLog(`[client] ${String(message)}`);
+      logFile(`[client] ${String(message)}`);
       return { ok: true, locked, visible: Boolean(win && !win.isDestroyed() && win.isVisible()) };
     });
 
@@ -569,7 +592,7 @@ module.exports = function activate(api) {
     //   锁定时点一下 = 弹出控制条（解除穿透，可拖动、可点按钮、可调字号）
     //   未锁定时点一下 = 重新锁定（鼠标穿透，打游戏不会误触）
     api.rpc.handle('toggle-tools', () => {
-      fileLog(`[client] 请求切换控制条（当前 locked=${locked}）`);
+      logFile(`[client] 请求切换控制条（当前 locked=${locked}）`);
       applyLock(!locked);
       if (win && !win.isDestroyed()) {
         win.showInactive();
@@ -583,7 +606,7 @@ module.exports = function activate(api) {
       hotkeysEnabled = !hotkeysEnabled;
       if (hotkeysEnabled) registerHotkeys();
       else unregisterHotkeys();
-      void api.storage.data.set('hotkeys', hotkeysEnabled)
+      void api.storage.set('hotkeys', hotkeysEnabled)
         .catch((error) => logErr('保存快捷键设置失败', error));
       log(`全局快捷键: ${hotkeysEnabled ? '开启' : '关闭'}`);
       return { ok: true, hotkeys: hotkeysEnabled };
@@ -626,9 +649,9 @@ module.exports = function activate(api) {
     }
   };
 
-  api.lifecycle.onDeactivate(() => {
+  api.onDispose(() => {
     disposed = true;
-    fileLog('=== mod 停用 ===');
+    logFile('=== mod 停用 ===');
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
@@ -642,5 +665,5 @@ module.exports = function activate(api) {
 
   start().catch((error) => logErr('启动失败', error));
 
-  return () => { fileLog('dispose 回调'); };
+  return () => { logFile('dispose 回调'); };
 };

@@ -1,10 +1,11 @@
 {
   "id": "desktop-lyric",
   "name": "桌面歌词",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "在桌面显示一行歌词（普通字体），支持锁定（鼠标穿透）、拖动、切换歌曲和自定义颜色。",
   "author": "aming2778",
   "folium": 1,
+  "folia": ">=0.7.21 <0.8.0",
   "preview": "preview.jpg",
   "main": "main.cjs",
   "client": "client.mjs",
